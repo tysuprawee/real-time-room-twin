@@ -71,8 +71,8 @@ drop policy if exists "own room layouts: delete" on public.room_layouts;
 create policy "own room layouts: delete" on public.room_layouts
     for delete to authenticated using (owner = auth.uid());
 
--- Kept for rooms saved by older builds. New builds write complete room files
--- to the Google Drive folder chosen in the app and store only their paths here.
+-- Kept for rooms saved by older builds. New builds send complete room files
+-- through the RoomTwin backend to the owner's Google Drive and store paths here.
 insert into storage.buckets (id, name, public, file_size_limit)
 values ('room-layouts', 'room-layouts', false, 52428800)
 on conflict (id) do update set public = false, file_size_limit = excluded.file_size_limit;

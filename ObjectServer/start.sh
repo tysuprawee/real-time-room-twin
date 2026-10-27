@@ -21,8 +21,12 @@ SSH=(ssh -o "ProxyCommand=$HOME/.local/bin/colab --auth=adc ssh --proxy-mode -s 
      -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 HOST=root@$SESSION
 TOKEN=${OBJECT_SERVER_TOKEN:-$(openssl rand -hex 16)}
-ADDRESS=$(ipconfig getifaddr en0 || ipconfig getifaddr en1 || true)
-[ -n "$ADDRESS" ] || { echo "this Mac has no Wi-Fi address"; exit 1; }
+LOCAL_NAME=$(scutil --get LocalHostName 2>/dev/null || true)
+ADDRESS=${ROOMTWIN_SERVER_HOST:-${LOCAL_NAME:+$LOCAL_NAME.local}}
+if [ -z "$ADDRESS" ]; then
+    ADDRESS=$(ipconfig getifaddr en0 || ipconfig getifaddr en1 || true)
+fi
+[ -n "$ADDRESS" ] || { echo "this Mac has no local-network address"; exit 1; }
 URL="http://$ADDRESS:$PORT"
 FAL_LOG=${FAL_LOG:-/tmp/roomtwin-fal-server.log}
 
@@ -133,11 +137,11 @@ fi
 
 CONFIG=$(mktemp -d)/object-server.json
 if [ "$REMOTE_STARTED" = 1 ] && [ "$FAL_READY" = 1 ]; then
-    printf '{"url": "%s", "token": "%s", "fallbackURL": "%s", "provider": "local"}\n' "$URL" "$TOKEN" "$FAL_URL" > "$CONFIG"
+    printf '{"url": "%s", "token": "%s", "fallbackURL": "%s", "driveURL": "%s", "provider": "local"}\n' "$URL" "$TOKEN" "$FAL_URL" "$FAL_URL" > "$CONFIG"
 elif [ "$REMOTE_STARTED" = 1 ]; then
     printf '{"url": "%s", "token": "%s", "provider": "local"}\n' "$URL" "$TOKEN" > "$CONFIG"
 else
-    printf '{"url": "%s", "token": "%s", "provider": "fal.ai"}\n' "$FAL_URL" "$TOKEN" > "$CONFIG"
+    printf '{"url": "%s", "token": "%s", "driveURL": "%s", "provider": "fal.ai"}\n' "$FAL_URL" "$TOKEN" "$FAL_URL" > "$CONFIG"
 fi
 if xcrun devicectl device copy to --device "$DEVICE" --domain-type appDataContainer --domain-identifier "$APP" \
     --source "$CONFIG" --destination Library/object-server.json > /dev/null 2>&1; then

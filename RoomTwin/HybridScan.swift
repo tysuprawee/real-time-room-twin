@@ -98,10 +98,10 @@ final class HybridScan: ObservableObject {
             instruction = "Move slowly and show every wall and piece of furniture"
         case .clean:
             summary = "Clean RoomPlan geometry · scan colours · manual SAM replacements"
-            instruction = "Red: photo needed · Yellow at 60% visible: tap Photo · Green: captured"
+            instruction = "Optional photos · Yellow at 20% visible · Green: captured · Skip to keep default shape"
         case .samFurnitureReplacement:
             summary = "Detailed room + RoomPlan-detected SAM targets"
-            instruction = "Red: photo needed · Yellow at 60% visible: tap Photo · Green: captured"
+            instruction = "Optional photos · Yellow at 20% visible · Green: captured · Skip to keep scanned shape"
         }
         usedDetailedFallback = false
         processingProgress = nil

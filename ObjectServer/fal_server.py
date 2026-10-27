@@ -28,6 +28,7 @@ import threading
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -46,12 +47,100 @@ FALKEY = os.environ["FALKEY"]
 FAL_ENDPOINT = "https://queue.fal.run/fal-ai/sam-3/3d-objects"
 FAL_SEGMENT_ENDPOINT = "https://queue.fal.run/fal-ai/sam-3/image"
 ASSIMP = os.environ.get("ASSIMP") or shutil.which("assimp")
+RCLONE = os.environ.get("RCLONE") or shutil.which("rclone")
+DRIVE_REMOTE = os.environ.get("ROOMTWIN_DRIVE_REMOTE", "roomtwin-owner:RoomTwin")
 MAX_SECONDS = 360
 FAL_ACCESS_ERROR = None
+DRIVE_ACCESS_ERROR = None
 
 
 class FalAPIError(RuntimeError):
     pass
+
+
+def safe_drive_parts(parts, filenames=False):
+    values = [urllib.parse.unquote(value) for value in parts]
+    pattern = r"[A-Za-z0-9._-]{1,128}" if filenames else r"[A-Za-z0-9-]{1,128}"
+    if not values or any(not re.fullmatch(pattern, value) or value in (".", "..") for value in values):
+        raise ValueError("invalid Drive path")
+    return values
+
+
+def drive_path(user, room, filename=None, kind="legacy-rooms"):
+    user, room = safe_drive_parts([user, room])
+    if kind not in {"legacy-rooms", "rooms", "objects"}:
+        raise ValueError("unsupported Drive collection")
+    root = DRIVE_REMOTE.rstrip('/')
+    path = (f"{root}/{user}/{room}" if kind == "legacy-rooms" else
+            f"{root}/Users/{user}/{kind.title()}/{room}")
+    if filename is not None:
+        filename = safe_drive_parts([filename], filenames=True)[0]
+        allowed = {"model.usdz", "thumb.jpg"} if kind == "objects" else {
+            "room.usdz", "room.ply", "room.json", "room-edits.json"}
+        if filename not in allowed:
+            raise ValueError("unsupported Drive file")
+        path += "/" + filename
+    return path
+
+
+def check_drive():
+    if not RCLONE:
+        return "rclone is not installed on the RoomTwin server."
+    remote = DRIVE_REMOTE.split(":", 1)[0] + ":"
+    result = subprocess.run([RCLONE, "listremotes"], capture_output=True, text=True, timeout=15)
+    if result.returncode or remote not in result.stdout.splitlines():
+        return (f"Owner Google Drive is not connected. Run: rclone config create "
+                f"{remote[:-1]} drive scope drive config_is_local true")
+    return None
+
+
+def drive_upload(stream, length, destination):
+    if DRIVE_ACCESS_ERROR:
+        raise RuntimeError(DRIVE_ACCESS_ERROR)
+    temporary = tempfile.NamedTemporaryFile(prefix="roomtwin-drive-", delete=False)
+    try:
+        remaining = length
+        with temporary:
+            while remaining:
+                block = stream.read(min(1024 * 1024, remaining))
+                if not block:
+                    raise ValueError("room upload ended early")
+                temporary.write(block)
+                remaining -= len(block)
+        result = subprocess.run([RCLONE, "copyto", temporary.name, destination,
+                                 "--drive-chunk-size", "64M", "--retries", "3"],
+                                capture_output=True, text=True, timeout=3600)
+        if result.returncode:
+            raise RuntimeError((result.stderr or result.stdout or "Google Drive upload failed")[-1000:])
+    finally:
+        try:
+            os.remove(temporary.name)
+        except FileNotFoundError:
+            pass
+
+
+def drive_download(source):
+    if DRIVE_ACCESS_ERROR:
+        raise RuntimeError(DRIVE_ACCESS_ERROR)
+    temporary = tempfile.NamedTemporaryFile(prefix="roomtwin-drive-", delete=False)
+    temporary.close()
+    result = subprocess.run([RCLONE, "copyto", source, temporary.name, "--retries", "3"],
+                            capture_output=True, text=True, timeout=3600)
+    if result.returncode:
+        try:
+            os.remove(temporary.name)
+        except FileNotFoundError:
+            pass
+        raise FileNotFoundError((result.stderr or result.stdout or source)[-1000:])
+    return temporary.name
+
+
+def drive_delete(directory):
+    if DRIVE_ACCESS_ERROR:
+        raise RuntimeError(DRIVE_ACCESS_ERROR)
+    result = subprocess.run([RCLONE, "purge", directory], capture_output=True, text=True, timeout=600)
+    if result.returncode and "directory not found" not in (result.stderr or "").lower():
+        raise RuntimeError((result.stderr or result.stdout or "Google Drive delete failed")[-1000:])
 
 
 def write_json(path, value):
@@ -601,17 +690,49 @@ def make_handler():
         def do_POST(self):
             self.route("POST")
 
+        def do_DELETE(self):
+            self.route("DELETE")
+
         def route(self, method):
             try:
                 if self.headers.get("X-Token") != TOKEN:
                     return self.reply(403, dict(error="wrong token"))
-                length = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(length)) if length else {}
                 path = self.path.split("?", 1)[0].strip("/").split("/")
                 if method == "GET" and path == ["health"]:
                     state = "failed" if FAL_ACCESS_ERROR else "ready"
                     return self.reply(200, dict(generator=dict(
-                        state=state, provider="fal.ai", message=FAL_ACCESS_ERROR)))
+                        state=state, provider="fal.ai", message=FAL_ACCESS_ERROR),
+                        drive=dict(state="failed" if DRIVE_ACCESS_ERROR else "ready",
+                                   provider="Google Drive", message=DRIVE_ACCESS_ERROR)))
+                kind = "legacy-rooms"
+                if len(path) >= 5 and path[:2] == ["drive", "assets"]:
+                    kind = path[2]
+                    if kind not in {"rooms", "objects"}:
+                        raise ValueError("unsupported Drive collection")
+                    path = ["drive", "rooms"] + path[3:]
+                if len(path) >= 4 and path[:2] == ["drive", "rooms"]:
+                    if method == "POST" and len(path) == 5:
+                        length = int(self.headers.get("Content-Length") or 0)
+                        if length <= 0:
+                            raise ValueError("empty room file")
+                        destination = drive_path(path[2], path[3], path[4], kind=kind)
+                        drive_upload(self.rfile, length, destination)
+                        relative = path[2:] if kind == "legacy-rooms" else [kind] + path[2:]
+                        return self.reply(200, dict(path="owner-drive:" + "/".join(relative)))
+                    if method == "GET" and len(path) == 5:
+                        temporary = drive_download(drive_path(path[2], path[3], path[4], kind=kind))
+                        try:
+                            return self.reply_file(200, temporary, "application/octet-stream")
+                        finally:
+                            try:
+                                os.remove(temporary)
+                            except FileNotFoundError:
+                                pass
+                    if method == "DELETE" and len(path) == 4:
+                        drive_delete(drive_path(path[2], path[3], kind=kind))
+                        return self.reply(200, dict(deleted=True))
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length)) if length else {}
                 if method == "POST" and path == ["photos"]:
                     return self.reply(200, add_photo(body))
                 if method == "POST" and len(path) == 3 and path[0] == "photos" and path[2] == "select":
@@ -642,6 +763,15 @@ def make_handler():
             self.end_headers()
             self.wfile.write(data)
 
+        def reply_file(self, status, path, content_type):
+            size = os.path.getsize(path)
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            with open(path, "rb") as file:
+                shutil.copyfileobj(file, self.wfile, length=1024 * 1024)
+
         def log_message(self, format, *args):
             if args and str(args[0]).startswith("GET /health"):
                 return
@@ -651,7 +781,7 @@ def make_handler():
 
 
 def main():
-    global FAL_ACCESS_ERROR
+    global FAL_ACCESS_ERROR, DRIVE_ACCESS_ERROR
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--host", default="0.0.0.0")
@@ -660,8 +790,11 @@ def main():
         raise SystemExit("assimp not found; install it with: brew install assimp")
     os.makedirs(ROOT, exist_ok=True)
     FAL_ACCESS_ERROR = fal_access_error()
+    DRIVE_ACCESS_ERROR = check_drive()
     if FAL_ACCESS_ERROR:
         print(f"fal.ai fallback unavailable: {FAL_ACCESS_ERROR}", flush=True)
+    if DRIVE_ACCESS_ERROR:
+        print(f"owner Drive unavailable: {DRIVE_ACCESS_ERROR}", flush=True)
     print(f"fal.ai SAM 3D fallback listening on {args.host}:{args.port}", flush=True)
     ThreadingHTTPServer((args.host, args.port), make_handler()).serve_forever()
 

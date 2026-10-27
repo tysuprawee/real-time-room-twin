@@ -3,6 +3,11 @@ import Foundation
 import ImageIO
 import SceneKit
 import simd
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
 /// A compacted copy of the live mesh.
 struct MeshSnapshot {
@@ -111,6 +116,21 @@ extension MeshSnapshot {
     /// triangles are sorted along a 3D Z-order curve and their cells laid out
     /// in 2D Z-order tiles: cells that get blended belong to nearby triangles.
     func writeUSDZ(to url: URL, adding nodes: [SCNNode] = []) throws {
+        // Resolve image contents while all source assets are still available.
+        // USDZ's writer can then package every texture with the full scene.
+        let assets = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: assets, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: assets) }
+        let exportNodes = try nodes.map { try selfContainedExportNode($0, assets: assets) }
+        if faces.isEmpty {
+            guard !exportNodes.isEmpty else { throw CocoaError(.fileWriteUnknown) }
+            let scene = SCNScene()
+            exportNodes.forEach { scene.rootNode.addChildNode($0) }
+            guard scene.write(to: url, options: nil, delegate: nil, progressHandler: nil) else {
+                throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: url.path])
+            }
+            return
+        }
         guard !faces.isEmpty else { throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: url.path]) }
         let tileSide = 32, cellsPerTile = tileSide * tileSide
         let tileCount = (faces.count + cellsPerTile - 1) / cellsPerTile
@@ -189,7 +209,7 @@ extension MeshSnapshot {
         let node = SCNNode(geometry: geometry)
         node.name = "Scan"
         scene.rootNode.addChildNode(node)
-        for decoration in nodes {
+        for decoration in exportNodes {
             scene.rootNode.addChildNode(decoration)
         }
         guard scene.write(to: url, options: nil, delegate: nil, progressHandler: nil) else {
@@ -209,6 +229,70 @@ extension MeshSnapshot {
         }
         return codes.indices.sorted { codes[$0] < codes[$1] }
     }
+}
+
+/// Copy materials before resolving their image contents: SceneKit clones share
+/// geometry/materials with the editor, so export must not change live materials.
+private func selfContainedExportNode(_ source: SCNNode, assets: URL) throws -> SCNNode {
+    let copy = source.clone()
+    var failure: Error?
+    copy.enumerateHierarchy { node, _ in
+        guard failure == nil, let original = node.geometry,
+              let geometry = original.copy() as? SCNGeometry else { return }
+        node.geometry = geometry
+        geometry.materials = original.materials.map { material in
+            let result = material.copy() as! SCNMaterial
+            let properties = [result.diffuse, result.normal, result.roughness, result.metalness,
+                              result.ambientOcclusion, result.emission, result.transparent,
+                              result.multiply, result.specular, result.displacement, result.reflective]
+            for property in properties {
+                do {
+                    guard let image = try exportTextureImage(property.contents) else { continue }
+                    let file = assets.appendingPathComponent(UUID().uuidString + ".png")
+                    guard let destination = CGImageDestinationCreateWithURL(file as CFURL, "public.png" as CFString, 1, nil) else {
+                        throw CocoaError(.fileWriteUnknown)
+                    }
+                    CGImageDestinationAddImage(destination, image, nil)
+                    guard CGImageDestinationFinalize(destination) else { throw CocoaError(.fileWriteUnknown) }
+                    property.contents = file
+                } catch { failure = error }
+            }
+            return result
+        }
+    }
+    if let failure { throw failure }
+    return copy
+}
+
+private func exportTextureImage(_ contents: Any?) throws -> CGImage? {
+    guard let contents else { return nil }
+    // Core Foundation casts do not perform Swift's conditional type check.
+    // Check the CF type identifier before interpreting the value as CGImage.
+    if CFGetTypeID(contents as CFTypeRef) == CGImage.typeID {
+        return (contents as! CGImage)
+    }
+    #if canImport(UIKit)
+    if let image = contents as? UIImage { return image.cgImage }
+    #elseif canImport(AppKit)
+    if let image = contents as? NSImage { return image.cgImage(forProposedRect: nil, context: nil, hints: nil) }
+    #endif
+    if let data = contents as? Data,
+       let source = CGImageSourceCreateWithData(data as CFData, nil) {
+        return CGImageSourceCreateImageAtIndex(source, 0, nil)
+    }
+    let file: URL?
+    if let url = contents as? URL { file = url }
+    else if let path = contents as? String {
+        file = path.hasPrefix("file:") ? URL(string: path) : URL(fileURLWithPath: path)
+    } else { file = nil }
+    if let file, file.isFileURL {
+        guard let source = CGImageSourceCreateWithURL(file as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: file.path])
+        }
+        return image
+    }
+    return nil
 }
 
 /// Spaces the low 10 bits of v two zero bits apart, for a 3D Morton code.

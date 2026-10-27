@@ -33,7 +33,9 @@ enum SAMFurnitureProcessor {
     static func run(folder: URL, photos: [KeyframeRecorder.SavedKeyframe],
                     progress: Progress) async throws -> [SAMFurnitureReplacement] {
         guard !photos.isEmpty else {
-            throw SAMFurnitureServerError(message: "No furniture reached 60% visibility. Scan again and frame each item in the viewport.")
+            progress(.init(title: "Keeping original furniture",
+                           detail: "No optional photos taken", fraction: 0.94))
+            return []
         }
         guard let config = ObjectServerConfig.load() else {
             throw SAMFurnitureServerError(message: "Start the SAM server with ObjectServer/start.sh before using SAM Furniture.")

@@ -1,5 +1,4 @@
 import SwiftUI
-import UniformTypeIdentifiers
 
 /// The first screen: log in, or make an account, with a username and password.
 struct LoginView: View {
@@ -84,25 +83,11 @@ struct LoginView: View {
 /// The account button over the main screen: who's signed in, and logging out.
 struct AccountMenu: View {
     @EnvironmentObject private var account: Account
-    @State private var choosingDriveFolder = false
-    @State private var driveError: String?
 
     var body: some View {
         Menu {
             Text("Logged in as \(account.session?.username ?? "")")
-            if let folder = account.roomDriveFolderName {
-                Text("Room storage: Google Drive / \(folder) / RoomTwin")
-                Button("Change Google Drive Folder", systemImage: "folder.badge.gearshape") {
-                    choosingDriveFolder = true
-                }
-                Button("Disconnect Room Folder", systemImage: "externaldrive.badge.xmark", role: .destructive) {
-                    account.disconnectRoomDriveFolder()
-                }
-            } else {
-                Button("Choose Google Drive Folder", systemImage: "externaldrive.badge.plus") {
-                    choosingDriveFolder = true
-                }
-            }
+            Label("Rooms save to RoomTwin's Drive", systemImage: "externaldrive.fill.badge.checkmark")
             Button("Log Out", systemImage: "rectangle.portrait.and.arrow.right", role: .destructive, action: account.signOut)
         } label: {
             Image(systemName: "person.crop.circle")
@@ -112,21 +97,5 @@ struct AccountMenu: View {
         }
         .padding(.leading, 8)
         .padding(.top, 4)
-        .fileImporter(isPresented: $choosingDriveFolder, allowedContentTypes: [.folder],
-                      allowsMultipleSelection: false) { result in
-            do {
-                guard let folder = try result.get().first else { return }
-                try account.connectRoomDriveFolder(folder)
-            } catch {
-                driveError = error.localizedDescription
-            }
-        }
-        .alert("Couldn’t use that Google Drive folder", isPresented: Binding(
-            get: { driveError != nil }, set: { if !$0 { driveError = nil } }
-        )) {
-            Button("OK") { driveError = nil }
-        } message: {
-            Text(driveError ?? "Choose a writable folder under Google Drive in Files.")
-        }
     }
 }

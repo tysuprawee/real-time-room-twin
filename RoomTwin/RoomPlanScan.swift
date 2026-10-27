@@ -100,8 +100,8 @@ final class RoomPlanScan: ObservableObject {
                         self.cleanFurnitureStates = states
                         self.cleanCanCapture = canCapture
                         self.cleanPhotoSummary = detected == 0 ? "Looking for furniture"
-                            : canCapture ? "Furniture ready · tap Photo · \(captured) of \(detected) captured"
-                            : "\(captured) of \(detected) captured · centre a furniture box"
+                            : canCapture ? "Optional Photo ready · \(captured) of \(detected) captured · others keep default shape"
+                            : "\(captured) of \(detected) captured · show 20% for optional Photo"
                     }
                 }
             } catch {
@@ -142,7 +142,7 @@ final class RoomPlanScan: ObservableObject {
         if accepted {
             Diagnostics.action("clean SAM furniture photo")
         } else {
-            cleanPhotoSummary = "Centre a detected furniture box until Photo becomes ready"
+            cleanPhotoSummary = "Show at least 20% of a furniture box for an optional photo"
         }
         return accepted
     }
@@ -483,7 +483,7 @@ struct RoomCaptureContainer: UIViewRepresentable {
     func updateUIView(_ view: RoomCaptureView, context: Context) {}
 }
 
-/// Status is shown only inside furniture. Red needs a photo, yellow is framed
+/// Status is shown only inside furniture. Red has no photo, yellow is framed
 /// well enough to capture, and green has already been captured for SAM.
 struct CleanFurnitureStatusOverlay: View {
     let indicators: [RoomPlanScan.CleanFurnitureIndicator]

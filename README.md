@@ -58,13 +58,16 @@ account** makes one. The session stays in the phone's Keychain, so you only log 
 person icon at the top left shows who's logged in and has **Log Out**.
 
 An account holds the objects and room layouts you scan. After Photo or Walk Around builds a model,
-**Save to My Objects** names it and uploads it with its photo. In a room preview, **My Objects**
+**Save to My Objects** names it and uploads it with its photo to the owner's Google Drive.
+SAM replacements use this same storage automatically. In a room preview, **My Objects**
 lists them; tap one and it stands on the floor where you're looking. The voice agent doesn't see
 these: they're only added with the button. After finishing a Room Layout scan, **Save to Account**
-uploads its edited USDZ, raw PLY and RoomPlan JSON to the signed-in user's private storage.
+sends its complete edited USDZ, raw PLY, RoomPlan JSON and edit metadata through the Mac gateway
+to the app owner's `RoomTwin` Google Drive folder. Users never sign into Google or choose a folder.
+Supabase stores only the per-user room record and owner-Drive paths.
 
-Accounts live on Supabase, which the app calls directly, so there's no server of our own. Set it
-up once:
+Accounts live on Supabase, which the app calls directly. Room files use the object-server Mac as
+the owner-Drive gateway. Set Supabase up once:
 
 1. Make a free Supabase project. Under **Authentication › Sign In / Providers › Email**, turn
    **Confirm email** off. Usernames become placeholder addresses (`name@users.roomtwin.app`)
@@ -78,6 +81,20 @@ up once:
 The anon key in the app can only do what row-level security allows: each user reads, adds and
 deletes their own rows, and files under a folder named after their user ID. The database URL is
 only used by the setup script and never goes into the app.
+
+Authorize the owner's Drive once on the Mac with
+`rclone config create roomtwin-owner drive scope drive config_is_local true`, then keep
+`bash ObjectServer/start.sh` running during the demo. The server stores rooms under
+`Google Drive/RoomTwin/Users/<Supabase user ID>/Rooms/<room ID>/`, with library models and
+thumbnails in `Google Drive/RoomTwin/Users/<Supabase user ID>/Objects/<object ID>/`.
+Older room paths remain readable. Google credentials remain in rclone's
+Mac configuration and are never copied to the app.
+
+Room Export and Save use the same USDZ writer. The USDZ packages the scene's editable
+furniture, SAM replacements, added models, walls/floor materials and enclosure together;
+image materials are resolved into temporary PNGs before packaging so textures travel with
+the model. The PLY sidecar is the original coloured scan archive, not a textured scene file.
+Edit metadata accompanies saved rooms to restore transforms, materials and lighting.
 
 ## Furnish by voice
 
@@ -217,7 +234,7 @@ Clean combines Hybrid's authoritative RoomPlan geometry with SAM Furniture's man
 workflow. Walls, floors, openings and unphotographed objects come from RoomPlan; the LiDAR mesh is
 used only as a colour/texture sample source and its irregular geometry is not included in the final
 Clean preview. Photographed furniture is replaced before the result is revealed. Structural guides
-remain white, while furniture follows the red / yellow-at-60% / green capture states described
+remain white, while furniture follows the red / yellow-at-20% / green capture states described
 below. Clean exports the raw detailed PLY as a source sidecar, the RoomPlan JSON, the final edited
 USDZ, and a SAM manifest identifying the clean output mode.
 
@@ -229,12 +246,17 @@ floor and irregular surface detail. RoomPlan is used only as the list and orient
 furniture that may be replaced.
 
 While scanning, an item becomes eligible only after its RoomPlan box has remained stable and at
-least 60% of that box is inside the phone viewport. Furniture boxes are red while a manual photo is
-still needed, yellow once they meet the 60% rule, and green after a photo is safely written. The user
+least 20% of that box is inside the phone viewport. All detected furniture, including low-confidence
+and small items, can be photographed. Furniture boxes are red before an optional manual photo,
+yellow once they meet the 20% rule, and green after a photo is safely written. The user
 must tap **Photo** while a box is yellow; RoomTwin rejects the shot otherwise. It saves exactly one
 colour/depth frame for the best visible yellow item and never photographs furniture automatically.
-The live status shows `captured / detected`; turn every intended item green before tapping
-**Finish**.
+The live status shows `captured / detected`. Each newly detected furniture item increases
+the session total; temporarily losing a live box does not decrease it. Reidentifying the
+same box does not add another checklist entry, and separate neighboring items count separately.
+Photos are optional: **Finish** also works with
+zero photos and does not contact SAM in that case. Unphotographed items keep their default
+RoomPlan shapes in Clean mode, or their scanned geometry in SAM Furniture mode.
 
 After Finish, RoomTwin hides the unfinished detailed scan and completes replacement before opening
 the result. The progress card names each real stage: finalizing RoomPlan, preparing the detailed

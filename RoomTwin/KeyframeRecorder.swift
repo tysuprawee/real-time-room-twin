@@ -16,7 +16,7 @@ import UIKit
 final class KeyframeRecorder: @unchecked Sendable {
     enum Mode {
         case continuous
-        /// One stable, mostly visible photo for each RoomPlan furniture item.
+        /// One optional photo for each RoomPlan furniture item.
         case detectedFurniture
     }
 
@@ -74,6 +74,11 @@ final class KeyframeRecorder: @unchecked Sendable {
     private var count = 0
     /// Main-thread state, updated by RoomPlan and consumed by `consider`.
     private var furnitureTargets: [UUID: FurnitureTarget] = [:]
+    /// Session-wide capture checklist. Live RoomPlan updates may temporarily
+    /// omit a box; that must not remove an item from the detected total.
+    private var detectedTargets: [UUID: FurnitureTarget] = [:]
+    private var detectionIDs: [UUID: UUID] = [:]
+    private var photographedDetectionIDs = Set<UUID>()
     private var scheduledTargets = Set<UUID>()
     private var capturedTargets: [FurnitureTarget] = []
     private var captureRequested = false
@@ -90,13 +95,15 @@ final class KeyframeRecorder: @unchecked Sendable {
     }
 
     /// Updates the live RoomPlan furniture boxes. A box must stop changing for
-    /// half a second before it can trigger its one photo. Low-confidence
-    /// guesses are allowed to settle and improve instead of consuming a shot.
+    /// half a second before the user can take its optional photo. Include
+    /// low-confidence detections so every detected item can be photographed.
     func updateFurniture(_ objects: [CapturedRoom.Object]) {
         guard mode == .detectedFurniture else { return }
         let now = ProcessInfo.processInfo.systemUptime
+        let liveIDs = Set(objects.map(\.identifier))
+        var assignedDetectionIDs = Set(liveIDs.compactMap { detectionIDs[$0] })
         var next: [UUID: FurnitureTarget] = [:]
-        for object in objects where object.confidence != .low {
+        for object in objects {
             let old = furnitureTargets[object.identifier]
             let moved = old.map { simd_distance($0.transform.position, object.transform.position) } ?? .infinity
             let resized = old.map { simd_length($0.dimensions - object.dimensions) } ?? .infinity
@@ -108,6 +115,21 @@ final class KeyframeRecorder: @unchecked Sendable {
                 identifier: object.identifier, category: RoomPlanMesh.name(of: object.category),
                 dimensions: object.dimensions, transform: object.transform,
                 stableSince: stable ? old!.stableSince : now)
+            guard let target = next[object.identifier] else { continue }
+            // Reuse a missing detection only for a nearly identical box.
+            // Two separate objects present in the same update always count
+            // separately, even if their boxes are close or overlapping.
+            let previousID = detectionIDs[target.identifier]
+            let reidentified = detectedTargets
+                .filter { !liveIDs.contains($0.value.identifier)
+                    && !assignedDetectionIDs.contains($0.key)
+                    && Self.sameFurniture($0.value, target) }
+                .min { simd_distance($0.value.transform.position, target.transform.position)
+                    < simd_distance($1.value.transform.position, target.transform.position) }?.key
+            let detectionID = previousID ?? reidentified ?? target.identifier
+            detectionIDs[target.identifier] = detectionID
+            detectedTargets[detectionID] = target
+            assignedDetectionIDs.insert(detectionID)
         }
         furnitureTargets = next
         var states: [UUID: FurniturePhotoState] = [:]
@@ -119,7 +141,7 @@ final class KeyframeRecorder: @unchecked Sendable {
     }
 
     /// Arms exactly one photo for the next live frame. The request is accepted
-    /// only while a stable, uncaptured box is yellow (at least 60% visible).
+    /// only while a stable, uncaptured box is yellow (at least 20% visible).
     @discardableResult
     func requestFurniturePhoto() -> Bool {
         guard mode == .detectedFurniture, pending == 0, !captureRequested,
@@ -253,7 +275,10 @@ final class KeyframeRecorder: @unchecked Sendable {
         pending -= 1
         guard let target else { return }
         scheduledTargets.remove(target.identifier)
-        if succeeded { capturedTargets.append(target) }
+        if succeeded {
+            capturedTargets.append(target)
+            photographedDetectionIDs.insert(detectionIDs[target.identifier] ?? target.identifier)
+        }
         var states = lastFurnitureStates
         for item in furnitureTargets.values where isDuplicateOfCaptured(item) {
             states[item.identifier] = .captured
@@ -261,9 +286,8 @@ final class KeyframeRecorder: @unchecked Sendable {
         publishFurnitureStatus(states)
     }
 
-    /// Highest-quality target whose projected box is at least 60% inside the
-    /// actual portrait viewport. A small apparent-size floor avoids spending a
-    /// furniture item's only photo while it is still far away.
+    /// Highest-quality target whose projected box is at least 20% inside the
+    /// actual portrait viewport. Small detected items are eligible too.
     private func eligibleFurniture(in frame: ARFrame, viewportSize requestedSize: CGSize)
         -> [(value: FurnitureTarget, coverage: Float)] {
         let now = ProcessInfo.processInfo.systemUptime
@@ -290,7 +314,7 @@ final class KeyframeRecorder: @unchecked Sendable {
             guard area > 0 else { continue }
             let coverage = Float(box.intersection(visible).area / area)
             let apparent = area / max(viewport.width * viewport.height, 1)
-            guard coverage >= 0.6, apparent >= 0.015 else { continue }
+            guard coverage >= 0.2 else { continue }
             eligible.append((target, coverage, apparent))
         }
         return eligible.sorted {
@@ -301,7 +325,7 @@ final class KeyframeRecorder: @unchecked Sendable {
     private func publishFurnitureStatus(_ states: [UUID: FurniturePhotoState]) {
         lastFurnitureStates = states
         let canCapture = states.values.contains(.ready) && pending == 0 && !captureRequested
-        let status = (capturedTargets.count, furnitureTargets.count, canCapture)
+        let status = (photographedDetectionIDs.count, detectedTargets.count, canCapture)
         guard lastReportedStatus?.captured != status.0
                 || lastReportedStatus?.detected != status.1
                 || lastReportedStatus?.canCapture != status.2
@@ -315,12 +339,23 @@ final class KeyframeRecorder: @unchecked Sendable {
     /// room. Treat a nearly identical box as the already photographed object,
     /// while keeping adjacent chairs separate.
     private func isDuplicateOfCaptured(_ target: FurnitureTarget) -> Bool {
-        capturedTargets.contains { captured in
-            guard captured.category == target.category else { return false }
-            let size = max(simd_length(captured.dimensions), 0.1)
-            return simd_distance(captured.transform.position, target.transform.position) < 0.08 * size
-                && simd_length(captured.dimensions - target.dimensions) < 0.12 * size
+        if let detectionID = detectionIDs[target.identifier],
+           photographedDetectionIDs.contains(detectionID) { return true }
+        return capturedTargets.contains { captured in
+            // For known distinct detections, proximity must not mark a new
+            // neighboring item as captured.
+            if let a = detectionIDs[captured.identifier], let b = detectionIDs[target.identifier] {
+                return a == b
+            }
+            return Self.sameFurniture(captured, target)
         }
+    }
+
+    private static func sameFurniture(_ a: FurnitureTarget, _ b: FurnitureTarget) -> Bool {
+        guard a.category == b.category else { return false }
+        let size = max(simd_length(a.dimensions), 0.1)
+        return simd_distance(a.transform.position, b.transform.position) < 0.08 * size
+            && simd_length(a.dimensions - b.dimensions) < 0.12 * size
     }
 }
 

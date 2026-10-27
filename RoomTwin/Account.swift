@@ -54,7 +54,6 @@ final class Account: ObservableObject {
     }
 
     @Published private(set) var session: Session?
-    @Published private(set) var roomDriveFolderName: String?
 
     static let config: (url: URL, key: String)? = {
         guard let file = Bundle.main.url(forResource: "supabase", withExtension: "json"),
@@ -68,16 +67,10 @@ final class Account: ObservableObject {
         .appendingPathComponent("MyObjects")
     private static let roomCache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("SavedRooms")
-    private static let roomDriveBookmarkKey = "room-drive-folder"
-    private static let roomDrivePrefix = "drive:"
-    private static let roomDriveDirectory = "RoomTwin"
+    private static let ownerDrivePrefix = "owner-drive:"
 
     init() {
         session = Keychain.read(Self.sessionKey).flatMap { try? JSONDecoder().decode(Session.self, from: $0) }
-        if let bookmark = UserDefaults.standard.data(forKey: Self.roomDriveBookmarkKey),
-           let folder = try? Self.resolveRoomDriveFolder(bookmark) {
-            roomDriveFolderName = folder.lastPathComponent
-        }
     }
 
     // MARK: Signing in
@@ -109,30 +102,6 @@ final class Account: ObservableObject {
         if let token {
             Task { _ = try? await call("auth/v1/logout", method: "POST", bearer: token) }
         }
-    }
-
-    // MARK: Google Drive room folder
-
-    /// Stores durable permission to a folder chosen from the iOS Files
-    /// picker. Choosing a folder under Google Drive lets RoomTwin write whole
-    /// room files there without shipping a Google API secret in the app.
-    func connectRoomDriveFolder(_ folder: URL) throws {
-        guard folder.startAccessingSecurityScopedResource() else {
-            throw Failure(errorDescription: "RoomTwin could not access that folder. Choose it again from Google Drive in Files.")
-        }
-        defer { folder.stopAccessingSecurityScopedResource() }
-        let root = folder.appendingPathComponent(Self.roomDriveDirectory, isDirectory: true)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let bookmark = try folder.bookmarkData(options: .minimalBookmark,
-                                               includingResourceValuesForKeys: nil,
-                                               relativeTo: nil)
-        UserDefaults.standard.set(bookmark, forKey: Self.roomDriveBookmarkKey)
-        roomDriveFolderName = folder.lastPathComponent
-    }
-
-    func disconnectRoomDriveFolder() {
-        UserDefaults.standard.removeObject(forKey: Self.roomDriveBookmarkKey)
-        roomDriveFolderName = nil
     }
 
     private static func email(for username: String) throws -> String {
@@ -184,38 +153,64 @@ final class Account: ObservableObject {
     /// Uploads a scanned model (USDZ) and its picture, and lists it in the account.
     func save(model: URL, thumbnail: UIImage?, name: String) async throws {
         guard let user = session?.userID else { throw Failure(errorDescription: "Log in first.") }
-        let folder = "\(user)/\(UUID().uuidString.lowercased())"
-        try await call("storage/v1/object/objects/\(folder)/model.usdz", method: "POST",
-                       body: try Data(contentsOf: model), contentType: "model/vnd.usdz+zip")
-        var thumbPath: String?
-        if let jpeg = thumbnail.flatMap(Self.smallJPEG) {
-            try await call("storage/v1/object/objects/\(folder)/thumb.jpg", method: "POST", body: jpeg, contentType: "image/jpeg")
-            thumbPath = "\(folder)/thumb.jpg"
+        let objectID = UUID().uuidString.lowercased()
+        let folder = "objects/\(user)/\(objectID)"
+        do {
+            try await ownerDriveUpload(model, user: user, room: objectID, filename: "model.usdz", kind: "objects")
+            var row: [String: Any] = ["name": name, "model_path": Self.ownerDrivePrefix + "\(folder)/model.usdz"]
+            if let jpeg = thumbnail.flatMap(Self.smallJPEG) {
+                let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("\(objectID)-thumb.jpg")
+                defer { try? FileManager.default.removeItem(at: temporary) }
+                try jpeg.write(to: temporary, options: .atomic)
+                try await ownerDriveUpload(temporary, user: user, room: objectID, filename: "thumb.jpg", kind: "objects")
+                row["thumb_path"] = Self.ownerDrivePrefix + "\(folder)/thumb.jpg"
+            }
+            try await call("rest/v1/objects", method: "POST", json: row)
+        } catch {
+            try? await ownerDriveDelete(user: user, room: objectID, kind: "objects")
+            throw error
         }
-        var row: [String: Any] = ["name": name, "model_path": "\(folder)/model.usdz"]
-        row["thumb_path"] = thumbPath
-        try await call("rest/v1/objects", method: "POST", json: row)
     }
 
     func delete(_ object: SavedObject) async throws {
+        if let parts = Self.ownerDriveParts(object.modelPath) {
+            try await ownerDriveDelete(user: parts.user, room: parts.room, kind: parts.kind)
+        } else {
+            try await call("storage/v1/object/objects", method: "DELETE",
+                           json: ["prefixes": [object.modelPath] + (object.thumbPath.map { [$0] } ?? [])])
+        }
         try await call("rest/v1/objects?id=eq.\(object.id.uuidString.lowercased())", method: "DELETE")
-        try await call("storage/v1/object/objects", method: "DELETE",
-                       json: ["prefixes": [object.modelPath] + (object.thumbPath.map { [$0] } ?? [])])
+        try? FileManager.default.removeItem(at: Self.cache.appendingPathComponent("\(object.id.uuidString).usdz"))
     }
 
     /// The model file, downloaded once and then kept on the phone.
     func modelFile(for object: SavedObject) async throws -> URL {
         let file = Self.cache.appendingPathComponent("\(object.id.uuidString).usdz")
         if !FileManager.default.fileExists(atPath: file.path) {
-            let data = try await call("storage/v1/object/authenticated/objects/\(object.modelPath)")
             try FileManager.default.createDirectory(at: Self.cache, withIntermediateDirectories: true)
-            try data.write(to: file, options: .atomic)
+            if let parts = Self.ownerDriveParts(object.modelPath) {
+                try await ownerDriveDownload(user: parts.user, room: parts.room,
+                                             filename: parts.filename, to: file, kind: parts.kind)
+            } else {
+                let data = try await call("storage/v1/object/authenticated/objects/\(object.modelPath)")
+                try data.write(to: file, options: .atomic)
+            }
         }
         return file
     }
 
     func thumbnail(for object: SavedObject) async -> UIImage? {
         guard let path = object.thumbPath else { return nil }
+        if let parts = Self.ownerDriveParts(path) {
+            let file = Self.cache.appendingPathComponent("\(object.id.uuidString)-thumb.jpg")
+            do {
+                if !FileManager.default.fileExists(atPath: file.path) {
+                    try await ownerDriveDownload(user: parts.user, room: parts.room,
+                                                 filename: parts.filename, to: file, kind: parts.kind)
+                }
+                return UIImage(contentsOfFile: file.path)
+            } catch { return nil }
+        }
         return (try? await call("storage/v1/object/authenticated/objects/\(path)")).flatMap(UIImage.init(data:))
     }
 
@@ -226,35 +221,27 @@ final class Account: ObservableObject {
         return try JSONDecoder().decode([SavedRoomLayout].self, from: data)
     }
 
-    /// Writes complete room files to the user's selected Google Drive folder,
-    /// then stores their relative paths and ownership record in Supabase.
+    /// Uploads complete room files through RoomTwin's authenticated Mac
+    /// gateway into the owner's Google Drive. App users never authenticate
+    /// with Google; Supabase continues to enforce ownership of room records.
     func saveRoomLayout(model: URL, ply: URL, json: URL, edits: URL, name: String) async throws {
         guard let user = session?.userID else { throw Failure(errorDescription: "Log in first.") }
-        let bookmark = try roomDriveBookmark()
-        let folder = "\(user)/\(UUID().uuidString.lowercased())"
+        let room = UUID().uuidString.lowercased()
+        let files = [("room.usdz", model), ("room.ply", ply),
+                     ("room.json", json), ("room-edits.json", edits)]
         do {
-            try await Task.detached(priority: .utility) {
-                try Self.withRoomDriveFolder(bookmark) { root in
-                    let destination = root.appendingPathComponent(folder, isDirectory: true)
-                    try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
-                    try Self.copyRoomFile(model, to: destination.appendingPathComponent("room.usdz"))
-                    try Self.copyRoomFile(ply, to: destination.appendingPathComponent("room.ply"))
-                    try Self.copyRoomFile(json, to: destination.appendingPathComponent("room.json"))
-                    try Self.copyRoomFile(edits, to: destination.appendingPathComponent("room-edits.json"))
-                }
-            }.value
+            for (filename, file) in files {
+                try await ownerDriveUpload(file, user: user, room: room, filename: filename)
+            }
+            let folder = "rooms/\(user)/\(room)"
             try await call("rest/v1/room_layouts", method: "POST",
                            json: ["name": name,
-                                  "model_path": Self.roomDrivePrefix + "\(folder)/room.usdz",
-                                  "ply_path": Self.roomDrivePrefix + "\(folder)/room.ply",
-                                  "json_path": Self.roomDrivePrefix + "\(folder)/room.json",
-                                  "edits_path": Self.roomDrivePrefix + "\(folder)/room-edits.json"])
+                                  "model_path": Self.ownerDrivePrefix + "\(folder)/room.usdz",
+                                  "ply_path": Self.ownerDrivePrefix + "\(folder)/room.ply",
+                                  "json_path": Self.ownerDrivePrefix + "\(folder)/room.json",
+                                  "edits_path": Self.ownerDrivePrefix + "\(folder)/room-edits.json"])
         } catch {
-            try? await Task.detached(priority: .utility) {
-                try Self.withRoomDriveFolder(bookmark) { root in
-                    try? FileManager.default.removeItem(at: root.appendingPathComponent(folder))
-                }
-            }.value
+            try? await ownerDriveDelete(user: user, room: room)
             throw error
         }
     }
@@ -268,13 +255,9 @@ final class Account: ObservableObject {
         var downloads = [(model, layout.modelPath), (json, layout.jsonPath)]
         if let edits, let path = layout.editsPath { downloads.append((edits, path)) }
         for (file, path) in downloads where !FileManager.default.fileExists(atPath: file.path) {
-            if let relative = Self.roomDriveRelativePath(path) {
-                let bookmark = try roomDriveBookmark()
-                try await Task.detached(priority: .utility) {
-                    try Self.withRoomDriveFolder(bookmark) { root in
-                        try Self.copyRoomFile(root.appendingPathComponent(relative), to: file)
-                    }
-                }.value
+            if let parts = Self.ownerDriveParts(path) {
+                try await ownerDriveDownload(user: parts.user, room: parts.room,
+                                             filename: parts.filename, to: file, kind: parts.kind)
             } else {
                 // Rooms saved by older builds remain readable.
                 let data = try await call("storage/v1/object/authenticated/room-layouts/\(path)")
@@ -285,14 +268,8 @@ final class Account: ObservableObject {
     }
 
     func delete(_ layout: SavedRoomLayout) async throws {
-        if let relative = Self.roomDriveRelativePath(layout.modelPath) {
-            let bookmark = try roomDriveBookmark()
-            let folder = URL(fileURLWithPath: relative).deletingLastPathComponent().path
-            try await Task.detached(priority: .utility) {
-                try Self.withRoomDriveFolder(bookmark) { root in
-                    try FileManager.default.removeItem(at: root.appendingPathComponent(folder))
-                }
-            }.value
+        if let parts = Self.ownerDriveParts(layout.modelPath) {
+            try await ownerDriveDelete(user: parts.user, room: parts.room, kind: parts.kind)
         } else {
             let objects = [layout.modelPath, layout.plyPath, layout.jsonPath]
                 + (layout.editsPath.map { [$0] } ?? [])
@@ -303,43 +280,61 @@ final class Account: ObservableObject {
         try? FileManager.default.removeItem(at: Self.roomCache.appendingPathComponent(layout.id.uuidString))
     }
 
-    private func roomDriveBookmark() throws -> Data {
-        guard let bookmark = UserDefaults.standard.data(forKey: Self.roomDriveBookmarkKey) else {
-            throw Failure(errorDescription: "Choose a Google Drive folder from the account menu before saving a room.")
+    private static func ownerDriveParts(_ path: String) -> (user: String, room: String, filename: String, kind: String)? {
+        guard path.hasPrefix(ownerDrivePrefix) else { return nil }
+        let parts = path.dropFirst(ownerDrivePrefix.count).split(separator: "/").map(String.init)
+        if parts.count == 3 { return (parts[0], parts[1], parts[2], "legacy-rooms") }
+        guard parts.count == 4, ["rooms", "objects"].contains(parts[0]) else { return nil }
+        return (parts[1], parts[2], parts[3], parts[0])
+    }
+
+    private func ownerDriveRequest(method: String, user: String, room: String,
+                                   filename: String? = nil, kind: String = "rooms") throws -> URLRequest {
+        guard let config = ObjectServerConfig.load(),
+              let address = config.driveURL ?? config.fallbackURL ?? (config.provider == "fal.ai" ? config.url : nil),
+              var url = URL(string: address) else {
+            throw Failure(errorDescription: "The owner Google Drive server is offline. Run ObjectServer/start.sh on the Mac.")
         }
-        return bookmark
-    }
-
-    private nonisolated static func resolveRoomDriveFolder(_ bookmark: Data) throws -> URL {
-        var stale = false
-        let folder = try URL(resolvingBookmarkData: bookmark, options: .withoutUI,
-                             relativeTo: nil, bookmarkDataIsStale: &stale)
-        guard !stale else {
-            throw Failure(errorDescription: "Google Drive folder permission expired. Choose the folder again.")
+        let route = kind == "legacy-rooms" ? ["drive", "rooms"] : ["drive", "assets", kind]
+        for component in route + [user, room] + (filename.map { [$0] } ?? []) {
+            url.appendPathComponent(component)
         }
-        return folder
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.setValue(config.token, forHTTPHeaderField: "X-Token")
+        request.timeoutInterval = 3600
+        return request
     }
 
-    private nonisolated static func withRoomDriveFolder<T>(_ bookmark: Data, body: (URL) throws -> T) throws -> T {
-        let selected = try resolveRoomDriveFolder(bookmark)
-        guard selected.startAccessingSecurityScopedResource() else {
-            throw Failure(errorDescription: "Google Drive is unavailable. Open Drive in Files, then choose the folder again.")
-        }
-        defer { selected.stopAccessingSecurityScopedResource() }
-        let root = selected.appendingPathComponent(roomDriveDirectory, isDirectory: true)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        return try body(root)
+    private func ownerDriveUpload(_ file: URL, user: String, room: String, filename: String, kind: String = "rooms") async throws {
+        let request = try ownerDriveRequest(method: "POST", user: user, room: room, filename: filename, kind: kind)
+        let (data, response) = try await URLSession.shared.upload(for: request, fromFile: file)
+        try Self.validateOwnerDrive(response, data: data)
     }
 
-    private nonisolated static func roomDriveRelativePath(_ path: String) -> String? {
-        path.hasPrefix(roomDrivePrefix) ? String(path.dropFirst(roomDrivePrefix.count)) : nil
-    }
-
-    private nonisolated static func copyRoomFile(_ source: URL, to destination: URL) throws {
+    private func ownerDriveDownload(user: String, room: String, filename: String, to destination: URL, kind: String = "rooms") async throws {
+        let request = try ownerDriveRequest(method: "GET", user: user, room: room, filename: filename, kind: kind)
+        let (temporary, response) = try await URLSession.shared.download(for: request)
+        try Self.validateOwnerDrive(response, data: nil)
         let files = FileManager.default
         try files.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         if files.fileExists(atPath: destination.path) { try files.removeItem(at: destination) }
-        try files.copyItem(at: source, to: destination)
+        try files.moveItem(at: temporary, to: destination)
+    }
+
+    private func ownerDriveDelete(user: String, room: String, kind: String = "rooms") async throws {
+        let request = try ownerDriveRequest(method: "DELETE", user: user, room: room, kind: kind)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try Self.validateOwnerDrive(response, data: data)
+    }
+
+    private static func validateOwnerDrive(_ response: URLResponse, data: Data?) throws {
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(status) else {
+            let reply = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            let message = reply?["error"] as? String
+            throw Failure(errorDescription: message ?? "Owner Google Drive failed (HTTP \(status)).")
+        }
     }
 
     private static func smallJPEG(_ image: UIImage) -> Data? {

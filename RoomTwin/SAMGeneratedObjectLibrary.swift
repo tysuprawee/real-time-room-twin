@@ -15,12 +15,16 @@ enum SAMGeneratedObjectLibrary {
                      in folder: URL, to account: Account,
                      progress: ((String) -> Void)? = nil) async -> Result {
         var result = Result()
+        guard let user = account.session?.userID else {
+            result.failures = replacements.map { "\($0.category): Log in to save this object." }
+            return result
+        }
         let output = folder.appendingPathComponent("sam-replacements")
         try? FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
 
         for (index, replacement) in replacements.enumerated() {
             let stem = replacement.targetIdentifier.lowercased()
-            let marker = output.appendingPathComponent("\(stem).library-saved")
+            let marker = output.appendingPathComponent("\(stem).\(user).owner-drive-library-saved")
             if FileManager.default.fileExists(atPath: marker.path) {
                 result.alreadySaved += 1
                 continue

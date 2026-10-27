@@ -10,6 +10,8 @@ struct ObjectServerConfig: Codable, Equatable {
     /// Optional Mac-hosted fal.ai gateway. The key remains in .env.local;
     /// only this authenticated local URL is sent to the phone.
     var fallbackURL: String? = nil
+    /// Mac gateway that writes complete room files to the owner's Drive.
+    var driveURL: String? = nil
     /// Identifies a fal-only primary even when the launcher selected a non-default port.
     var provider: String? = nil
 
@@ -326,7 +328,10 @@ final class ObjectCapture: ObservableObject {
         }
         var request = URLRequest(url: base.appending(path: path))
         request.httpMethod = method
-        request.timeoutInterval = method == "POST" ? 120 : 30
+        // A stale Mac address used to leave Picture mode saying "Uploading"
+        // for two minutes. The gateway is local, so fail promptly and show a
+        // useful retry message when it cannot be reached.
+        request.timeoutInterval = method == "POST" ? 45 : 30
         request.setValue(server.token, forHTTPHeaderField: "X-Token")
         if let body {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)

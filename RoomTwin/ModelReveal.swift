@@ -89,8 +89,13 @@ struct ModelReveal: View {
             Group {
                 if let mac = sender.knownMac {
                     VStack(spacing: 2) {
-                        Image(systemName: "chevron.up")
-                            .symbolEffect(.bounce, options: .repeating.speed(0.5))
+                        if #available(iOS 18.0, *) {
+                            Image(systemName: "chevron.up")
+                                .symbolEffect(.bounce, options: .repeating.speed(0.5))
+                        } else {
+                            Image(systemName: "chevron.up")
+                                .symbolEffect(.bounce, value: popped)
+                        }
                         Text(sender.preloadState(for: model) == .ready ? "Swipe up here to show it on \(mac)"
                              : "Swipe up here to send to \(mac)")
                     }

@@ -144,7 +144,7 @@ final class ScanController: ObservableObject {
         if accepted {
             Diagnostics.action("SAM furniture photo")
         } else {
-            samFurniturePhotoSummary = "Move a red box fully into frame; yellow means ready"
+            samFurniturePhotoSummary = "Optional photos · show 20% of a red box to turn it yellow"
         }
         return accepted
     }
@@ -365,7 +365,7 @@ final class ScanController: ObservableObject {
         let result = await Task.detached(priority: .userInitiated) {
             SAMFurnitureMesh.build(room: room, detailed: replacementBase, replacements: replacements)
         }.value
-        guard result.replacements > 0 else {
+        guard replacements.isEmpty || result.replacements > 0 else {
             throw CocoaError(.fileReadCorruptFile, userInfo: [NSLocalizedDescriptionKey:
                 "Generated models no longer matched the final RoomPlan furniture identifiers."])
         }
@@ -473,8 +473,8 @@ final class ScanController: ObservableObject {
                 self.samFurniturePhotoSummary = detected == 0
                     ? "Looking for furniture"
                     : canCapture
-                        ? "Yellow box ready · tap Photo · \(captured) of \(detected) captured"
-                        : "\(captured) of \(detected) captured · centre a red box"
+                        ? "\(captured) of \(detected) captured · optional Photo ready"
+                        : "\(captured) of \(detected) captured · photos optional"
                 self.renderer?.setFurniturePhotoStates(states)
             }
         } catch {
